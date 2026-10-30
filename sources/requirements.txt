@@ -1,0 +1,4 @@
+# The simulators are standard-library Python. These two are optional sinks:
+# pyarrow writes parquet (telemetry), kafka-python publishes to Redpanda (app events).
+pyarrow==17.0.0
+kafka-python-ng==2.2.3

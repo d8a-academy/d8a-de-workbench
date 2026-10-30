@@ -1,0 +1,39 @@
+# d8a-de-workbench: one target per warehouse you may choose (decision 8 of the
+# DE path). `dev` is the Compose Postgres. Switch with `dbt build --target duckdb`.
+warehouse:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: "{{ env_var('POSTGRES_HOST', 'localhost') }}"
+      port: 5432
+      user: "{{ env_var('POSTGRES_USER', 'd8a') }}"
+      password: "{{ env_var('POSTGRES_PASSWORD', 'd8a') }}"
+      dbname: "{{ env_var('POSTGRES_DB', 'warehouse') }}"
+      schema: staging
+      threads: 4
+    duckdb:
+      # pip install dbt-duckdb. One file on disk, no account.
+      type: duckdb
+      path: ../data/warehouse.duckdb
+      schema: staging
+      threads: 4
+    bigquery:
+      # pip install dbt-bigquery. The sandbox is free, no card. `gcloud auth application-default login` first.
+      type: bigquery
+      method: oauth
+      project: "{{ env_var('BQ_PROJECT', 'your-project-id') }}"
+      dataset: staging
+      location: EU
+      threads: 4
+    snowflake:
+      # pip install dbt-snowflake. 30-day trial.
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT', 'xy12345.eu-central-1') }}"
+      user: "{{ env_var('SNOWFLAKE_USER', 'student') }}"
+      password: "{{ env_var('SNOWFLAKE_PASSWORD', '') }}"
+      role: ACCOUNTADMIN
+      database: WAREHOUSE
+      warehouse: COMPUTE_WH
+      schema: STAGING
+      threads: 4

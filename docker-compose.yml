@@ -1,0 +1,251 @@
+# d8a-de-workbench: the local data platform of the D8A Data Engineering path.
+#
+# Profiles keep a laptop usable. Nothing but postgres starts without one:
+#   docker compose --profile app up -d                 the app context's simulated sources
+#   docker compose --profile app --profile airflow up  plus Airflow (P4)
+#   docker compose --profile app --profile redpanda up plus a Kafka-compatible broker (P5, app)
+#   docker compose --profile operations --profile minio up   the parquet lake (P5, operations)
+# The Makefile wraps these: make up CONTEXT=app PROFILE="airflow redpanda".
+
+name: d8a-de-workbench
+
+x-pg-env: &pg-env
+  POSTGRES_USER: ${POSTGRES_USER:-d8a}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-d8a}
+  POSTGRES_DB: ${POSTGRES_DB:-warehouse}
+
+services:
+  # ── The warehouse (and, in the app context, the source system) ────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      <<: *pg-env
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+      - ./data:/data:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-d8a} -d ${POSTGRES_DB:-warehouse}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # ── dbt, run on demand: docker compose run --rm dbt build ─────────────────
+  dbt:
+    image: ghcr.io/dbt-labs/dbt-postgres:1.8.latest
+    profiles:
+      - tools
+    working_dir: /usr/app/dbt
+    environment:
+      <<: *pg-env
+      DBT_PROFILES_DIR: /usr/app/dbt
+      POSTGRES_HOST: postgres
+    volumes:
+      - ./dbt:/usr/app/dbt
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ["dbt"]
+    command: ["--version"]
+
+  # ── Simulated source systems, one per data context ────────────────────────
+  sources-app:
+    build: ./sources
+    profiles:
+      - app
+    command: ["python", "app_events.py", "--sink", "file", "--out", "/data/app_events", "--rate", "${APP_EVENTS_RATE:-20}", "--kafka", "${APP_EVENTS_KAFKA:-}"]
+    volumes:
+      - ./data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  sources-finance:
+    build: ./sources
+    profiles:
+      - finance
+    command: ["python", "eod_files.py", "--out", "/data/eod/incoming", "--at", "${EOD_AT:-02:00}", "--backfill", "${EOD_BACKFILL:-7}"]
+    volumes:
+      - ./data:/data
+
+  sources-marketing:
+    build: ./sources
+    profiles:
+      - marketing
+    command: ["python", "saas_api.py", "--port", "8080"]
+    ports:
+      - "${SAAS_API_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8080/v1/health')\""]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  sources-operations:
+    build: ./sources
+    profiles:
+      - operations
+    command: ["python", "telemetry.py", "--out", "/data/lake/telemetry", "--vehicles", "${TELEMETRY_VEHICLES:-400}", "--backfill-days", "${TELEMETRY_BACKFILL_DAYS:-1}", "--s3", "${TELEMETRY_S3:-}"]
+    volumes:
+      - ./data:/data
+
+  # ── Airflow (profile airflow): webserver, scheduler, its own database ─────
+  airflow-db:
+    image: postgres:16-alpine
+    profiles:
+      - airflow
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflowdb:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  airflow-init:
+    image: apache/airflow:2.9.3-python3.11
+    profiles:
+      - airflow
+    environment: &airflow-env
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db/airflow
+      AIRFLOW__WEBSERVER__SECRET_KEY: d8a-workbench
+      AIRFLOW__CORE__FERNET_KEY: ""
+      AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: "10"
+      # dbt for the dbt task, psycopg 3 for the pipeline package of Project 2, psycopg2 for the shipped healthcheck DAG.
+      _PIP_ADDITIONAL_REQUIREMENTS: dbt-postgres==1.8.* psycopg[binary]==3.2.* psycopg2-binary==2.9.* pydantic==2.9.* tenacity==9.0.* requests==2.32.*
+      # The warehouse, for your DAGs.
+      WAREHOUSE_DSN: postgresql://${POSTGRES_USER:-d8a}:${POSTGRES_PASSWORD:-d8a}@postgres:5432/${POSTGRES_DB:-warehouse}
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        airflow db migrate && airflow users create --username admin --password admin --firstname D8A --lastname Student --role Admin --email student@example.com || true
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+
+  airflow-webserver:
+    image: apache/airflow:2.9.3-python3.11
+    profiles:
+      - airflow
+    environment: *airflow-env
+    command: webserver
+    ports:
+      - "${AIRFLOW_PORT:-8081}:8080"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./dbt:/opt/airflow/dbt
+      - ./pipeline:/opt/airflow/pipeline
+      - ./sources:/opt/airflow/sources:ro
+      - ./data:/data
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  airflow-scheduler:
+    image: apache/airflow:2.9.3-python3.11
+    profiles:
+      - airflow
+    environment: *airflow-env
+    command: scheduler
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./dbt:/opt/airflow/dbt
+      - ./pipeline:/opt/airflow/pipeline
+      - ./sources:/opt/airflow/sources:ro
+      - ./data:/data
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ── Redpanda (profile redpanda): Kafka API on 9092, console on 8082 ────────
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    profiles:
+      - redpanda
+    command:
+      - redpanda start
+      - --overprovisioned
+      - --smp 1
+      - --memory 1G
+      - --reserve-memory 0M
+      - --node-id 0
+      - --check=false
+      - --kafka-addr PLAINTEXT://0.0.0.0:29092,OUTSIDE://0.0.0.0:9092
+      - --advertise-kafka-addr PLAINTEXT://redpanda:29092,OUTSIDE://localhost:9092
+      - --schema-registry-addr 0.0.0.0:8085
+    ports:
+      - "9092:9092"
+      - "8085:8085"
+    volumes:
+      - redpanda:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  redpanda-console:
+    image: redpandadata/console:v2.7.2
+    profiles:
+      - redpanda
+    environment:
+      KAFKA_BROKERS: redpanda:29092
+      KAFKA_SCHEMAREGISTRY_ENABLED: "true"
+      KAFKA_SCHEMAREGISTRY_URLS: http://redpanda:8085
+    ports:
+      - "8082:8080"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+  # ── MinIO (profile minio): S3 on 9000, console on 9001, bucket `lake` ──────
+  minio:
+    image: minio/minio:RELEASE.2024-10-13T13-34-11Z
+    profiles:
+      - minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-d8a}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-d8a-lake-password}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  minio-init:
+    image: minio/mc:RELEASE.2024-10-08T09-37-26Z
+    profiles:
+      - minio
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-d8a} ${MINIO_ROOT_PASSWORD:-d8a-lake-password} &&
+        mc mb --ignore-existing local/lake && echo "bucket lake ready"
+    depends_on:
+      minio:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  airflowdb:
+  redpanda:
+  minio:

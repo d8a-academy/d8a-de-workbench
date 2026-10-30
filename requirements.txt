@@ -1,0 +1,7 @@
+# Your pipeline's dependencies (P2 onwards). The workbench itself needs none of these on the host.
+psycopg[binary]==3.2.3
+pydantic==2.9.2
+tenacity==9.0.0
+requests==2.32.3
+pytest==8.3.3
+ruff==0.6.9

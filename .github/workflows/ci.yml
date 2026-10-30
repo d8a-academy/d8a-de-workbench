@@ -1,0 +1,31 @@
+# d8a-de-workbench: the CI every project repo inherits. On every push:
+# the Compose file is valid, the Python is linted and tested, the dbt project parses.
+name: ci
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compose file is valid
+        run: docker compose config -q
+      - name: Lint
+        run: pip install ruff && ruff check pipeline tests sources
+      - name: Tests
+        run: |
+          pip install -r requirements.txt 2>/dev/null || true
+          pip install pytest
+          python -m pytest -q tests
+      - name: dbt parses
+        if: hashFiles('dbt/dbt_project.yml') != ''
+        run: |
+          pip install dbt-postgres==1.8.*
+          cd dbt && dbt deps && dbt parse --profiles-dir .
+        env:
+          POSTGRES_HOST: localhost
+          POSTGRES_USER: d8a
+          POSTGRES_PASSWORD: d8a
+          POSTGRES_DB: warehouse
